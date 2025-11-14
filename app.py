@@ -5,21 +5,18 @@ import tensorflow as tf
 import paho.mqtt.client as mqtt
 import json
 
-# ---------------- CONFIGURACIÓN STREAMLIT ----------------
+# ---------------- CONFIG STREAMLIT ----------------
 st.set_page_config(page_title="Casa Inteligente Multimodal", layout="wide")
 
-# ---------------- CONFIGURACIÓN MQTT ----------------
-MQTT_BROKER = "broker.hivemq.com"   # Debe ser el mismo en el ESP32
+# ---------------- CONFIG MQTT ----------------
+MQTT_BROKER = "157.230.214.127"  # El mismo que en el ESP32
 MQTT_PORT = 1883
-MQTT_TOPIC = "cmqtt_a"              # Topic que escucha tu ESP32 (cmqtt_a)
+MQTT_TOPIC = "cmqtt_a"           # Topic al que está suscrito el ESP32
 
 
 @st.cache_resource
 def get_mqtt_client():
-    """
-    Crea y mantiene un cliente MQTT conectado.
-    Se ejecuta una sola vez gracias a cache_resource.
-    """
+    """Crea y mantiene un cliente MQTT conectado."""
     client = mqtt.Client()
     client.connect(MQTT_BROKER, MQTT_PORT, 60)
     client.loop_start()
@@ -28,12 +25,12 @@ def get_mqtt_client():
 
 def publish_sala_json():
     """
-    Envía por MQTT el estado de la SALA en formato JSON:
+    Envía el estado de la SALA en el formato que espera el ESP32:
+
     {
-      "Act1": "ON"/"OFF",   -> Luz sala
-      "Analog": 0-100       -> Puerta sala (0 cerrada, 100 abierta)
+      "Act1": "ON"/"OFF",   -> luz sala (GPIO2)
+      "Analog": 0-100       -> puerta sala (servo GPIO13)
     }
-    Este formato es el que espera tu código de ESP32 en Wokwi.
     """
     client = get_mqtt_client()
     sala = st.session_state.devices["sala"]
@@ -49,12 +46,12 @@ def publish_sala_json():
     client.publish(MQTT_TOPIC, json.dumps(payload))
 
 
-# ---------------- CARGA DEL MODELO TM ----------------
+# ---------------- CARGA MODELO TEACHABLE MACHINE ----------------
 @st.cache_resource
 def load_tm_model():
     """
-    Carga el modelo de Teachable Machine desde gestos.h5 en la raíz del repo.
-    Si falla, devolvemos None y la app sigue funcionando sin la parte de gestos.
+    Carga el modelo 'gestos.h5' desde la raíz del repo.
+    Si falla, devuelve None.
     """
     try:
         model = tf.keras.models.load_model("gestos.h5", compile=False)
@@ -71,9 +68,7 @@ TM_CLASSES = ["luz_on", "luz_off", "ventilador_on", "ventilador_off"]
 
 
 def predict_gesto(image: Image.Image):
-    """
-    Pasa una imagen por el modelo de TM y devuelve (clase, probabilidad).
-    """
+    """Clasifica un gesto usando el modelo de TM."""
     image = image.convert("RGB")
     img = image.resize((224, 224))
     arr = np.array(img) / 255.0
@@ -84,13 +79,13 @@ def predict_gesto(image: Image.Image):
     return TM_CLASSES[idx], float(preds[idx])
 
 
-# ---------------- ESTADO INICIAL DE DISPOSITIVOS ----------------
+# ---------------- ESTADO INICIAL ----------------
 if "devices" not in st.session_state:
     st.session_state.devices = {
         "sala": {
             "luz": False,
             "brillo": 50,
-            "ventilador": 1,    # 0=apagado, 1-3 velocidad
+            "ventilador": 1,     # 0=apagado, 1-3 velocidad
             "puerta_cerrada": True,
             "presencia": False,
         },
@@ -136,14 +131,12 @@ def ejecutar_comando(comando: str):
     if "encender ventilador" in comando and dev["ventilador"] == 0:
         dev["ventilador"] = 1
 
-    # Puerta
-    if "abrir puerta" in comando and room == "sala":
-        dev["puerta_cerrada"] = False
-    if "cerrar puerta" in comando and room == "sala":
-        dev["puerta_cerrada"] = True
-
-    # Solo publicamos MQTT para la sala (la que está conectada al ESP32)
+    # Puerta solo para sala
     if room == "sala":
+        if "abrir puerta" in comando:
+            dev["puerta_cerrada"] = False
+        if "cerrar puerta" in comando:
+            dev["puerta_cerrada"] = True
         publish_sala_json()
 
     st.success(f"✅ Comando aplicado en {room.capitalize()}")
@@ -189,12 +182,13 @@ if pagina == "Panel general":
             st.metric("Sensor", presencia)
 
             c1, c2 = st.columns(2)
-            # Botón sala/habitación
+            # Luz
             with c1:
                 if st.button(f"Luz ON/OFF {room}", key=f"btn_luz_{room}"):
                     dev["luz"] = not dev["luz"]
                     if room == "sala":
                         publish_sala_json()
+            # Puerta
             with c2:
                 if st.button(f"Abrir/Cerrar puerta {room}", key=f"btn_puerta_{room}"):
                     dev["puerta_cerrada"] = not dev["puerta_cerrada"]
@@ -202,13 +196,12 @@ if pagina == "Panel general":
                         publish_sala_json()
 
     st.markdown("---")
-    st.subheader("Simulación física (WOKWI + MQTT)")
+    st.subheader("Simulación física (ESP32 + Wokwi + MQTT)")
     st.write(
-        "La SALA está conectada a un ESP32 en Wokwi mediante MQTT.\n\n"
-        "- Luz sala → LED en el pin 2 del ESP32\n"
-        "- Puerta sala → Servo en el pin 13 del ESP32\n"
-        "La app envía mensajes JSON al topic `cmqtt_a` del broker "
-        f"`{MQTT_BROKER}` para actualizar el hardware simulado."
+        "La **sala** está conectada a un ESP32 en Wokwi mediante MQTT.\n\n"
+        "- Luz sala → LED en el pin 2 del ESP32 (campo JSON `Act1`)\n"
+        "- Puerta sala → Servo en el pin 13 del ESP32 (campo JSON `Analog`)\n"
+        f"Se envía JSON al topic `{MQTT_TOPIC}` en el broker `{MQTT_BROKER}`."
     )
 
 
@@ -235,7 +228,6 @@ elif pagina == "Control por ambiente":
         "Simular persona presente", value=dev["presencia"]
     )
 
-    # Publicar MQTT solo si es la sala
     if room == "sala":
         publish_sala_json()
 
@@ -248,7 +240,7 @@ elif pagina == "Control por ambiente":
     )
 
 
-# ---------------- PÁGINA 3: CONTROL POR GESTOS (TM) ----------------
+# ---------------- PÁGINA 3: CONTROL POR GESTOS ----------------
 else:
     st.title("Control por gestos con Teachable Machine")
 
@@ -257,9 +249,9 @@ else:
     else:
         st.markdown(
             "Usa gestos frente a la cámara para controlar **la sala**:\n"
-            "- `luz_on` / `luz_off`\n"
-            "- `ventilador_on` / `ventilador_off` (solo se refleja en la app)\n"
-            "La luz y la puerta pueden enviarse al ESP32 a través de MQTT."
+            "- `luz_on` / `luz_off` (encienden/apagan la luz)\n"
+            "- `ventilador_on` / `ventilador_off` (solo app)\n"
+            "La luz y la puerta se envían al ESP32 vía MQTT como JSON."
         )
 
         foto = st.camera_input("Haz tu gesto y toma la foto")
@@ -281,7 +273,6 @@ else:
             elif clase == "ventilador_off":
                 dev["ventilador"] = 0
 
-            # Enviamos estado de la sala al ESP32 (luz y puerta)
             publish_sala_json()
 
             st.success("Estado de la sala actualizado y enviado por MQTT.")
@@ -296,3 +287,4 @@ else:
             "Este módulo demuestra control multimodal: interfaz gráfica, comandos de texto "
             "y reconocimiento de gestos usando Teachable Machine."
         )
+
