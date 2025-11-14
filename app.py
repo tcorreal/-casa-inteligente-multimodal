@@ -2,23 +2,48 @@ import streamlit as st
 import numpy as np
 from PIL import Image
 import tensorflow as tf
+import paho.mqtt.client as mqtt  # MQTT
 
 # ---------------- CONFIGURACIÓN STREAMLIT ----------------
 st.set_page_config(page_title="Casa Inteligente Multimodal", layout="wide")
+
+# ---------------- CONFIGURACIÓN MQTT ----------------
+MQTT_BROKER = "broker.hivemq.com"
+MQTT_PORT = 1883
+MQTT_BASE_TOPIC = "casa_oscar"  # cambia 'oscar' si quieres algo más único
+
+
+@st.cache_resource
+def get_mqtt_client():
+    """Crea un cliente MQTT y lo deja conectado."""
+    client = mqtt.Client()
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client.loop_start()  # para que mantenga la conexión en segundo plano
+    return client
+
+
+def publish_room_state(room: str):
+    """Publica el estado de un ambiente (sala/habitacion) por MQTT."""
+    client = get_mqtt_client()
+    dev = st.session_state.devices[room]
+    base = f"{MQTT_BASE_TOPIC}/{room}"
+
+    client.publish(f"{base}/luz", "ON" if dev["luz"] else "OFF")
+    client.publish(f"{base}/ventilador", str(dev["ventilador"]))
+    client.publish(
+        f"{base}/puerta", "CERRADA" if dev["puerta_cerrada"] else "ABIERTA"
+    )
+    client.publish(f"{base}/presencia", "1" if dev["presencia"] else "0")
 
 
 # ---------------- CARGA DEL MODELO TM ----------------
 @st.cache_resource
 def load_tm_model():
-    """
-    Carga el modelo de Teachable Machine una sola vez.
-    El archivo debe estar en la raíz del proyecto con el nombre: gestos.h5
-    """
+    """Carga el modelo de Teachable Machine (gestos.h5 en la raíz del repo)."""
     model = tf.keras.models.load_model("gestos.h5", compile=False)
     return model
 
 
-# Intentamos cargar el modelo. Si falla, la app igual funciona.
 tm_model = None
 try:
     tm_model = load_tm_model()
@@ -27,31 +52,28 @@ except Exception as e:
     TM_AVAILABLE = False
     tm_error = str(e)
 
-# Clases en el mismo orden en que se entrenaron en Teachable Machine
 TM_CLASSES = ["luz_on", "luz_off", "ventilador_on", "ventilador_off"]
 
 
 def predict_gesto(image: Image.Image):
-    """
-    Recibe una imagen PIL, la prepara y devuelve la clase predicha y su probabilidad.
-    """
+    """Pasa una imagen por el modelo y devuelve clase + probabilidad."""
     image = image.convert("RGB")
-    img = image.resize((224, 224))  # tamaño típico de TM
+    img = image.resize((224, 224))
     arr = np.array(img) / 255.0
-    arr = np.expand_dims(arr, axis=0)  # shape (1, 224, 224, 3)
+    arr = np.expand_dims(arr, axis=0)
 
     preds = tm_model.predict(arr)[0]
     idx = int(np.argmax(preds))
     return TM_CLASSES[idx], float(preds[idx])
 
 
-# ---------------- ESTADO INICIAL DE DISPOSITIVOS ----------------
+# ---------------- ESTADO INICIAL ----------------
 if "devices" not in st.session_state:
     st.session_state.devices = {
         "sala": {
             "luz": False,
             "brillo": 50,
-            "ventilador": 1,   # 0=apagado, 1-3 velocidad
+            "ventilador": 1,
             "puerta_cerrada": True,
             "presencia": False,
         },
@@ -67,11 +89,10 @@ if "devices" not in st.session_state:
 devices = st.session_state.devices
 
 
-# ---------------- FUNCIÓN PARA COMANDOS DE TEXTO ----------------
+# ---------------- COMANDOS DE TEXTO ----------------
 def ejecutar_comando(comando: str):
     comando = comando.lower().strip()
 
-    # 1. Detectar ambiente
     if "sala" in comando:
         room = "sala"
     elif "habitacion" in comando or "habitación" in comando or "cuarto" in comando:
@@ -82,13 +103,11 @@ def ejecutar_comando(comando: str):
 
     dev = devices[room]
 
-    # 2. Luz
     if "encender luz" in comando:
         dev["luz"] = True
     if "apagar luz" in comando:
         dev["luz"] = False
 
-    # 3. Ventilador
     if "subir ventilador" in comando:
         dev["ventilador"] = min(3, dev["ventilador"] + 1)
     if "bajar ventilador" in comando:
@@ -98,16 +117,16 @@ def ejecutar_comando(comando: str):
     if "encender ventilador" in comando and dev["ventilador"] == 0:
         dev["ventilador"] = 1
 
-    # 4. Puerta
     if "abrir puerta" in comando:
         dev["puerta_cerrada"] = False
     if "cerrar puerta" in comando:
         dev["puerta_cerrada"] = True
 
-    st.success(f"✅ Comando aplicado en {room.capitalize()}")
+    publish_room_state(room)
+    st.success(f"✅ Comando aplicado en {room.capitalize()} y enviado por MQTT.")
 
 
-# ---------------- SIDEBAR: NAVEGACIÓN Y COMANDOS ----------------
+# ---------------- SIDEBAR ----------------
 st.sidebar.title("Casa Inteligente")
 
 pagina = st.sidebar.radio(
@@ -138,10 +157,7 @@ if pagina == "Panel general":
             st.subheader(room.capitalize())
             luz_estado = "Encendida 💡" if dev["luz"] else "Apagada 💡"
             puerta_estado = "Cerrada 🔒" if dev["puerta_cerrada"] else "Abierta 🔓"
-            if dev["ventilador"] == 0:
-                vent_estado = "Apagado 🌀"
-            else:
-                vent_estado = f"Velocidad {dev['ventilador']} 🌀"
+            vent_estado = "Apagado 🌀" if dev["ventilador"] == 0 else f"Velocidad {dev['ventilador']} 🌀"
             presencia = "Persona detectada 🧍" if dev["presencia"] else "Sin presencia"
 
             st.metric("Luz", luz_estado)
@@ -149,21 +165,21 @@ if pagina == "Panel general":
             st.metric("Puerta", puerta_estado)
             st.metric("Sensor", presencia)
 
-            # Botones rápidos
             c1, c2 = st.columns(2)
             with c1:
                 if st.button(f"Luz ON/OFF {room}", key=f"btn_luz_{room}"):
                     dev["luz"] = not dev["luz"]
+                    publish_room_state(room)
             with c2:
                 if st.button(f"Abrir/Cerrar puerta {room}", key=f"btn_puerta_{room}"):
                     dev["puerta_cerrada"] = not dev["puerta_cerrada"]
+                    publish_room_state(room)
 
     st.markdown("---")
-    st.subheader("Simulación física (WOKWI / Arduino)")
+    st.subheader("Simulación física (WOKWI / MQTT)")
     st.write(
-        "Los estados de luz y puerta representan el estado de los LEDs y el servo "
-        "en un simulador como WOKWI. En el informe puedes explicar cómo estos "
-        "estados se enviarían a un microcontrolador real."
+        "Cada cambio en los estados se publica vía MQTT en el broker "
+        f"**{MQTT_BROKER}**, en tópicos como `{MQTT_BASE_TOPIC}/sala/luz`."
     )
 
 
@@ -176,24 +192,21 @@ elif pagina == "Control por ambiente":
 
     st.subheader(f"Configuración de {room.capitalize()}")
 
-    # Luz
     dev["luz"] = st.toggle("Luz encendida", value=dev["luz"])
     dev["brillo"] = st.slider("Brillo de la luz", 0, 100, dev["brillo"])
-
-    # Ventilador
     dev["ventilador"] = st.slider(
         "Velocidad ventilador (0 = apagado)", 0, 3, dev["ventilador"]
     )
 
-    # Puerta
     puerta_label = "Puerta cerrada" if dev["puerta_cerrada"] else "Puerta abierta"
     if st.button(puerta_label, key=f"btn_puerta_detalle_{room}"):
         dev["puerta_cerrada"] = not dev["puerta_cerrada"]
 
-    # Sensor de presencia (simulado)
     dev["presencia"] = st.checkbox(
         "Simular persona presente", value=dev["presencia"]
     )
+
+    publish_room_state(room)
 
     st.markdown("### Vista visual")
     st.write(
@@ -201,11 +214,6 @@ elif pagina == "Control por ambiente":
         f"🔒 Puerta: {'Cerrada' if dev['puerta_cerrada'] else 'Abierta'} | "
         f"🌀 Ventilador: {dev['ventilador']} | "
         f"🧍 Presencia: {'Sí' if dev['presencia'] else 'No'}"
-    )
-
-    st.info(
-        "En la maqueta o en WOKWI puedes asociar: "
-        "LED = luz, Servo = puerta, otro LED o display = ventilador."
     )
 
 
@@ -219,8 +227,8 @@ else:
     else:
         st.markdown(
             "Usa gestos frente a la cámara para controlar **la sala**:\n"
-            "- Gesto para `luz_on` o `luz_off`\n"
-            "- Gesto para `ventilador_on` o `ventilador_off`\n"
+            "- `luz_on` / `luz_off`\n"
+            "- `ventilador_on` / `ventilador_off`\n"
         )
 
         foto = st.camera_input("Haz tu gesto y toma la foto")
@@ -231,7 +239,7 @@ else:
 
             st.write(f"🔍 Modelo detectó: **{clase}** (confianza: {prob:.2f})")
 
-            dev = devices["sala"]  # controlamos la sala con gestos
+            dev = devices["sala"]
 
             if clase == "luz_on":
                 dev["luz"] = True
@@ -242,7 +250,9 @@ else:
             elif clase == "ventilador_off":
                 dev["ventilador"] = 0
 
-            st.success("Estado de la sala actualizado con el gesto.")
+            publish_room_state("sala")
+
+            st.success("Estado de la sala actualizado con el gesto y enviado por MQTT.")
             st.write(
                 f"💡 Luz sala: {'Encendida' if dev['luz'] else 'Apagada'} | "
                 f"🌀 Ventilador sala: {dev['ventilador']}"
@@ -250,6 +260,6 @@ else:
 
         st.markdown("---")
         st.caption(
-            "Este módulo demuestra una interfaz multimodal visual usando Teachable Machine."
+            "Este módulo demuestra control multimodal (UI + texto + gestos) "
+            "y envía los estados a un dispositivo físico simulado vía MQTT."
         )
-
